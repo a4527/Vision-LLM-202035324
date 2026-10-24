@@ -46,7 +46,17 @@ def count_fingers(hand):
     return count
 
 
-def apply_filter(frame, finger_count):
+def calculate_strength(hand, frame_shape, far_size=0.08, near_size=0.30):
+    """손목(0)~중지 시작 관절(9) 길이를 화면 높이로 나눠 강도로 변환."""
+    height, width = frame_shape[:2]
+    dx = (hand[9].x - hand[0].x) * width
+    dy = (hand[9].y - hand[0].y) * height
+    # x, y의 정규화 기준이 다르므로 픽셀 거리로 계산한 뒤 높이로 나눈다.
+    palm_size = np.hypot(dx, dy) / height
+    return float(np.clip((palm_size - far_size) / (near_size - far_size), 0, 1))
+
+
+def make_filter(frame, finger_count):
     """모든 결과를 BGR 3채널로 반환하여 같은 방식으로 글씨를 그린다."""
     if finger_count == 1:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -68,43 +78,23 @@ def apply_filter(frame, finger_count):
     return frame.copy()
 
 
-def open_camera(camera, device):
-    if camera == "webcam":
-        # WSL/Linux에서는 V4L2를 직접 사용해 자동 백엔드 선택을 피한다.
-        backend = cv2.CAP_V4L2 if sys.platform.startswith("linux") else cv2.CAP_ANY
-        cap = cv2.VideoCapture(device, backend)
-        if cap.isOpened():
-            # USB/IP 전달 시 전송량을 줄이기 위해 압축 영상(MJPEG)을 요청한다.
-            # 지원 여부에 따라 드라이버가 다른 설정을 선택할 수 있다.
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            cap.set(cv2.CAP_PROP_FPS, 30)
-            fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
-            pixel_format = "".join(chr((fourcc >> (8 * i)) & 255) for i in range(4))
-            print(
-                f"Camera: device={device}, format={pixel_format!r}, "
-                f"size={cap.get(cv2.CAP_PROP_FRAME_WIDTH):.0f}x"
-                f"{cap.get(cv2.CAP_PROP_FRAME_HEIGHT):.0f}, "
-                f"fps={cap.get(cv2.CAP_PROP_FPS):g}", flush=True,
-            )
-        return cap
-    if camera == "usb":
-        # mp-test.py와 동일한 USB YUYV 카메라 설정.
-        source = (
-            f"v4l2src device=/dev/video{device} ! "
-            "video/x-raw,format=YUY2,width=640,height=480,framerate=30/1 ! "
-            "videoconvert ! video/x-raw,format=BGR ! "
-        )
-    else:
-        source = (
-            f"nvarguscamerasrc sensor-id={device} ! "
-            "video/x-raw(memory:NVMM),width=1280,height=720,framerate=30/1 ! "
-            "nvvidconv ! video/x-raw,format=BGRx ! "
-            "videoconvert ! video/x-raw,format=BGR ! "
-        )
-    pipeline = source + (
-        "queue leaky=downstream max-size-buffers=1 ! "
+def apply_filter(frame, finger_count, strength=1.0):
+    """원본과 필터 결과를 혼합한다. 0=원본, 1=필터 최대 효과."""
+    strength = float(np.clip(strength, 0, 1))
+    if finger_count == 0 or strength == 0:
+        return frame.copy()
+    filtered = make_filter(frame, finger_count)
+    return cv2.addWeighted(frame, 1 - strength, filtered, strength, 0)
+
+
+def open_camera(device):
+    """02 노트북의 YUYV 파이프라인. GStreamer에서는 YUY2로 지정한다."""
+    pipeline = (
+        f"v4l2src device=/dev/video{device} ! "
+        "video/x-raw,format=YUY2,width=640,height=480,framerate=30/1 ! "
+        "videoconvert ! video/x-raw,format=BGR ! "
+        "queue leaky=downstream max-size-buffers=1 "
+        "max-size-bytes=0 max-size-time=0 ! "
         "appsink drop=true max-buffers=1 sync=false"
     )
     return cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
@@ -112,18 +102,30 @@ def open_camera(camera, device):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--camera", choices=("usb", "csi", "webcam"), default="usb")
     parser.add_argument("--device", type=int, default=0, help="카메라 번호 (기본: 0)")
     parser.add_argument("--model", type=Path, default=MODEL_PATH, help="손 인식 모델 경로")
+    parser.add_argument("--far-size", type=float, default=0.08,
+                        help="강도 0%%가 되는 손바닥 길이/화면 높이 비율 (기본: 0.08)")
+    parser.add_argument("--near-size", type=float, default=0.30,
+                        help="강도 100%%가 되는 손바닥 길이/화면 높이 비율 (기본: 0.30)")
     args = parser.parse_args()
+    if args.device < 0:
+        parser.error("--device는 0 이상의 카메라 번호여야 합니다.")
+    if not 0 <= args.far_size < args.near_size <= 1:
+        parser.error("0 <= --far-size < --near-size <= 1이어야 합니다.")
 
     # 필터 함수만 따로 확인할 때는 MediaPipe가 필요하지 않다.
     try:
         import mediapipe as mp
         from mediapipe.tasks import python
         from mediapipe.tasks.python import vision
-    except ImportError:
-        parser.error("MediaPipe가 없습니다. Project01/README.md의 설치 안내를 확인하세요.")
+    except ImportError as error:
+        parser.error(
+            f"MediaPipe import 실패: {error}\n"
+            f"실행 중인 Python: {sys.executable}\n"
+            "수업용 Python 환경을 활성화한 후 다시 실행하세요. "
+            "Section-Project/README.md의 설치 안내도 확인하세요."
+        )
     if not args.model.is_file():
         parser.error(f"손 인식 모델이 없습니다: {args.model}\nREADME.md의 다운로드 안내를 확인하세요.")
 
@@ -132,10 +134,14 @@ def main():
         num_hands=1,
     )
     with vision.HandLandmarker.create_from_options(options) as detector:
-        cap = open_camera(args.camera, args.device)
+        cap = open_camera(args.device)
         try:
             if not cap.isOpened():
-                raise RuntimeError("카메라를 열 수 없습니다. 카메라 종류와 --device 번호를 확인하세요.")
+                raise RuntimeError(
+                    f"/dev/video{args.device} 카메라를 열 수 없습니다. "
+                    "장치 번호, 접근 권한, OpenCV의 GStreamer 지원 및 "
+                    "YUYV 640x480 30fps 지원 여부를 확인하세요."
+                )
 
             active_count = 0
             previous_count = None
@@ -145,8 +151,8 @@ def main():
                 if not ret:
                     raise RuntimeError(
                         "카메라는 열렸지만 영상 프레임을 받지 못했습니다. "
-                        "위 Camera 설정과 경고 메시지를 확인하세요. "
-                        "WSL에서는 usbipd 연결 및 카메라 전송 형식 확인이 필요합니다."
+                        "카메라의 YUYV 640x480 30fps 지원 여부와 "
+                        "GStreamer 경고 메시지를 확인하세요."
                     )
 
                 # 거울처럼 좌우 반전. 필터 적용 전 원본에서 손을 인식한다.
@@ -170,12 +176,19 @@ def main():
                     if consecutive_frames >= STABLE_FRAMES:
                         active_count = detected_count
 
-                output = apply_filter(frame, active_count)
+                # 현재 프레임의 손 크기만 사용한다. 객체 추적이나 거리(cm) 측정은 하지 않는다.
+                strength = 0.0
+                if hand is not None and active_count != 0:
+                    strength = calculate_strength(
+                        hand, frame.shape, args.far_size, args.near_size,
+                    )
+                output = apply_filter(frame, active_count, strength)
                 # 필터 적용 후 글씨를 그려서 어떤 필터에서도 읽을 수 있게 한다.
                 detected_text = str(detected_count) if hand is not None else "NO HAND"
                 lines = (
                     f"Fingers: {detected_text}",
                     f"Filter: {active_count} - {FILTER_NAMES[active_count]}",
+                    f"Strength: {strength:.0%}  (Near: strong / Far: weak)",
                     "1:Gray  2:Blur  3:Edge  4:Sharp  5:Hue",
                     "0 / No hand: Original    Q / ESC: Quit",
                 )
@@ -185,6 +198,13 @@ def main():
                                 0.5, (0, 0, 0), 4, cv2.LINE_AA)
                     cv2.putText(output, text, position, cv2.FONT_HERSHEY_SIMPLEX,
                                 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+
+                # 막대 전체 길이가 100%, 채워진 부분이 현재 강도.
+                cv2.rectangle(output, (10, 140), (210, 154), (0, 0, 0), -1)
+                if strength > 0:
+                    cv2.rectangle(output, (10, 140), (10 + round(200 * strength), 154),
+                                  (0, 255, 255), -1)
+                cv2.rectangle(output, (10, 140), (210, 154), (255, 255, 255), 1)
 
                 cv2.imshow("Finger Camera Filters", output)
                 key = cv2.waitKey(1) & 0xFF
