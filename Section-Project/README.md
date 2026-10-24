@@ -190,9 +190,27 @@ python3 Section-Project/finger_filter.py --device 0 --far-size 0.06 --near-size 
 ```
 
 카메라 종류를 선택하는 `--camera` 옵션은 사용하지 않습니다.
-종료는 영상 창에서 `q` 또는 `ESC`를 누르거나 창을 닫으면 됩니다.
+종료는 영상 창에서 `q` 또는 `ESC`를 누릅니다.
+GUI 백엔드에 따라 지원되지 않는 창 상태 조회가 종료를 유발하지 않도록,
+창 닫힘 속성으로 자동 종료 여부를 판단하지 않습니다.
 
 ## 오류 해결과 검증 범위
+
+`exK.py`는 동작하지만 프로젝트가 시작되지 않는 경우 같은 Python 환경에서
+`exK.py`를 종료한 뒤 다음 명령으로 실행 단계를 확인합니다.
+
+```bash
+python3 -u Section-Project/finger_filter.py --debug
+```
+
+프로젝트는 `exK.py`처럼 카메라를 먼저 엽니다. 첫 프레임을 받은 뒤
+MediaPipe를 import하고 모델을 로드합니다. 손 인식 초기화와 카메라 초기화를
+분리하여 진행 상태를 확인할 수 있게 한 순서입니다.
+출력은 카메라 열기, 첫 프레임 수신, MediaPipe import, 모델 로드,
+첫 손 인식, 필터 처리, 영상 창 표시 순서입니다.
+멈춘 경우 마지막 `[DEBUG]` 줄과 이후 오류를 확인합니다.
+`canberra-gtk-module`이나 `Cannot query video position` 경고만으로
+실패 단계를 확정하지 않습니다. 이 진단 옵션은 추가 설치가 필요하지 않습니다.
 
 | 증상 | 확인할 내용 |
 |---|---|

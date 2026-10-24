@@ -104,6 +104,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, default=0, help="카메라 번호 (기본: 0)")
     parser.add_argument("--model", type=Path, default=MODEL_PATH, help="손 인식 모델 경로")
+    parser.add_argument("--debug", action="store_true", help="실행 단계와 첫 프레임 처리 상태 출력")
     parser.add_argument("--far-size", type=float, default=0.08,
                         help="강도 0%%가 되는 손바닥 길이/화면 높이 비율 (기본: 0.08)")
     parser.add_argument("--near-size", type=float, default=0.30,
@@ -114,35 +115,51 @@ def main():
     if not 0 <= args.far_size < args.near_size <= 1:
         parser.error("0 <= --far-size < --near-size <= 1이어야 합니다.")
 
-    # 필터 함수만 따로 확인할 때는 MediaPipe가 필요하지 않다.
-    try:
-        import mediapipe as mp
-        from mediapipe.tasks import python
-        from mediapipe.tasks.python import vision
-    except ImportError as error:
-        parser.error(
-            f"MediaPipe import 실패: {error}\n"
-            f"실행 중인 Python: {sys.executable}\n"
-            "수업용 Python 환경을 활성화한 후 다시 실행하세요. "
-            "Section-Project/README.md의 설치 안내도 확인하세요."
-        )
+    def log(message):
+        if args.debug:
+            print(f"[DEBUG] {message}", flush=True)
+
+    log(f"Python: {sys.executable}; OpenCV: {cv2.__version__} ({cv2.__file__})")
     if not args.model.is_file():
         parser.error(f"손 인식 모델이 없습니다: {args.model}\nREADME.md의 다운로드 안내를 확인하세요.")
 
-    options = vision.HandLandmarkerOptions(
-        base_options=python.BaseOptions(model_asset_path=str(args.model)),
-        num_hands=1,
-    )
-    with vision.HandLandmarker.create_from_options(options) as detector:
-        cap = open_camera(args.device)
-        try:
-            if not cap.isOpened():
-                raise RuntimeError(
-                    f"/dev/video{args.device} 카메라를 열 수 없습니다. "
-                    "장치 번호, 접근 권한, OpenCV의 GStreamer 지원 및 "
-                    "YUYV 640x480 30fps 지원 여부를 확인하세요."
-                )
+    # exK.py처럼 카메라를 먼저 시작한다. 손 인식 모델 초기화와 분리해 확인한다.
+    log("카메라 열기 시작 (YUYV 640x480 30fps)")
+    cap = open_camera(args.device)
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(
+                f"/dev/video{args.device} 카메라를 열 수 없습니다. "
+                "장치 번호, 접근 권한, OpenCV의 GStreamer 지원 및 "
+                "YUYV 640x480 30fps 지원 여부를 확인하세요."
+            )
+        log("카메라 열기 완료; 첫 프레임 읽기 시작")
+        ret, preview = cap.read()
+        if not ret:
+            raise RuntimeError("모델 초기화 전 카메라의 첫 프레임을 받지 못했습니다.")
+        log(f"첫 프레임 수신 완료: {preview.shape}; MediaPipe import 시작")
 
+        # 카메라 입력을 확인한 뒤에 손 인식 라이브러리와 모델을 초기화한다.
+        try:
+            import mediapipe as mp
+            from mediapipe.tasks import python
+            from mediapipe.tasks.python import vision
+        except ImportError as error:
+            parser.error(
+                f"MediaPipe import 실패: {error}\n"
+                f"실행 중인 Python: {sys.executable}\n"
+                "수업용 Python 환경을 활성화한 후 다시 실행하세요. "
+                "Section-Project/README.md의 설치 안내도 확인하세요."
+            )
+
+        log(f"MediaPipe import 완료; 모델 로드 시작: {args.model}")
+        options = vision.HandLandmarkerOptions(
+            base_options=python.BaseOptions(model_asset_path=str(args.model)),
+            num_hands=1,
+        )
+        with vision.HandLandmarker.create_from_options(options) as detector:
+            log("모델 로드 완료; 필터 반복 처리 시작")
+            first_frame = True
             active_count = 0
             previous_count = None
             consecutive_frames = 0
@@ -156,9 +173,13 @@ def main():
                     )
 
                 # 거울처럼 좌우 반전. 필터 적용 전 원본에서 손을 인식한다.
+                if first_frame:
+                    log(f"모델 로드 후 프레임 수신 완료: {frame.shape}; 손 인식 시작")
                 frame = cv2.flip(frame, 1)
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 result = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+                if first_frame:
+                    log("첫 손 인식 완료; 필터 처리 시작")
                 hand = result.hand_landmarks[0] if result.hand_landmarks else None
                 detected_count = count_fingers(hand) if hand is not None else None
 
@@ -206,15 +227,18 @@ def main():
                                   (0, 255, 255), -1)
                 cv2.rectangle(output, (10, 140), (210, 154), (255, 255, 255), 1)
 
+                if first_frame:
+                    log("첫 필터 처리 완료; 영상 창 표시 시작")
                 cv2.imshow("Finger Camera Filters", output)
                 key = cv2.waitKey(1) & 0xFF
+                if first_frame:
+                    log("영상 창 표시 완료; 반복 처리 중 (종료: q 또는 ESC)")
+                    first_frame = False
                 if key in (ord("q"), 27):
                     break
-                if cv2.getWindowProperty("Finger Camera Filters", cv2.WND_PROP_VISIBLE) < 1:
-                    break
-        finally:
-            cap.release()
-            cv2.destroyAllWindows()
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
