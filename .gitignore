@@ -2,3 +2,4 @@
 .venv/
 venv/
 env/
+src/datasets/cifar-10-python.tar.gz
