@@ -1,0 +1,14 @@
+{
+  "yolo_model": "../src/models/YOLO/yolo11n.pt",
+  "gemma_model": "../src/models/Gemma4/google_gemma-4-E2B-it-Q4_K_M.gguf",
+  "whisper_cli": "../whisper.cpp/build-cpu/bin/whisper-cli",
+  "whisper_model": "../whisper.cpp/models/ggml-base.bin",
+  "piper_python": "../.piper_venv/bin/python",
+  "piper_model": "../src/models/Piper/ko_KR-kss-medium.onnx",
+  "camera": 0,
+  "confidence": 0.4,
+  "mic_device": "default",
+  "speaker_device": "default",
+  "record_seconds": 5,
+  "gpu_layers": -1
+}
