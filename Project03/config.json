@@ -10,5 +10,5 @@
   "mic_device": "default",
   "speaker_device": "default",
   "record_seconds": 5,
-  "gpu_layers": -1
+  "gpu_layers": 0
 }

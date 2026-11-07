@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 import subprocess
+import time
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -65,7 +66,7 @@ def ask_gemma(llm, scene_text, question):
             )},
             {"role": "user", "content": f"탐지 결과:\n{scene_text}\n\n질문: {question}"},
         ],
-        max_tokens=160,
+        max_tokens=96,
         temperature=0.2,
     )
     answer = (response["choices"][0]["message"]["content"] or "").strip()
@@ -85,28 +86,37 @@ def text_to_speech(text, config, audio_dir):
     ], check=True, timeout=120)
 
 
-def main():
-    import cv2
-    from ultralytics import YOLO
-    from llama_cpp import Llama
-
-    config = load_config()
-    audio_dir = PROJECT_DIR / "runtime"
-    audio_dir.mkdir(exist_ok=True)
-    print("모델을 불러오는 중입니다...", flush=True)
-    yolo = YOLO(config["yolo_model"])
-    llm = Llama(model_path=config["gemma_model"], n_gpu_layers=config["gpu_layers"],
-                n_ctx=2048, n_batch=32, n_ubatch=32, verbose=False)
-    # 기존 장비에서 사용한 GStreamer 설정으로 카메라를 연다.
+def open_camera(cv2, config):
+    # 장비 입력은 기존 형식을 유지하고, 처리할 영상만 작게 줄인다.
     pipeline = (
         f"v4l2src device=/dev/video{config['camera']} ! "
         "video/x-raw,format=YUY2,width=640,height=480,framerate=30/1 ! "
-        "videoconvert ! video/x-raw,format=BGR ! "
         "queue leaky=downstream max-size-buffers=1 "
         "max-size-bytes=0 max-size-time=0 ! "
+        "videorate drop-only=true ! video/x-raw,framerate=10/1 ! "
+        "videoscale ! video/x-raw,width=320,height=240 ! "
+        "videoconvert ! video/x-raw,format=BGR ! "
         "appsink drop=true max-buffers=1 sync=false"
     )
-    cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+    return cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+
+
+def main():
+    import cv2
+    import torch
+    from ultralytics import YOLO
+
+    # CPU를 전부 사용하지 않도록 스레드 수를 제한한다.
+    torch.set_num_threads(2)
+    cv2.setNumThreads(1)
+    config = load_config()
+    audio_dir = PROJECT_DIR / "runtime"
+    audio_dir.mkdir(exist_ok=True)
+    print("YOLO를 불러오는 중입니다...", flush=True)
+    yolo = YOLO(config["yolo_model"])
+    llm = None
+    cap = open_camera(cv2, config)
+    failures = 0
     print("v: 음성 질문 / q: 종료", flush=True)
 
     try:
@@ -115,30 +125,55 @@ def main():
         while True:
             ok, frame = cap.read()
             if not ok:
-                print("카메라 프레임을 읽지 못했습니다.")
-                break
+                failures += 1
+                print(f"카메라 읽기 실패 ({failures}/3)", flush=True)
+                if failures >= 3:
+                    print("장치 연결, 지원 영상 형식, 전원 상태를 확인해 주세요.")
+                    break
+                cap.release()
+                if cv2.waitKey(500) & 0xFF == ord("q"):
+                    break
+                time.sleep(0.5)
+                cap = open_camera(cv2, config)
+                continue
+            failures = 0
 
-            result = yolo.predict(frame, conf=config["confidence"], imgsz=640,
-                                  max_det=15, verbose=False)[0]
-            cv2.imshow("Desk assistant - v: ask, q: quit", result.plot())
+            cv2.imshow("Desk assistant - v: ask, q: quit", frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
             if key == ord("v"):
-                # 버튼을 누른 장면으로 질문한다. 답변이 끝나면 카메라로 돌아온다.
-                scene_text = detections_to_text(result, frame.shape[1])
-                print(f"\n탐지 결과:\n{scene_text}", flush=True)
+                # Nano의 부하를 줄이기 위해 질문할 때만 탐지한다.
+                cap.release()
                 try:
+                    result = yolo.predict(frame, conf=config["confidence"], imgsz=320,
+                                          max_det=5, verbose=False)[0]
+                    cv2.imshow("Desk assistant - v: ask, q: quit", result.plot())
+                    cv2.waitKey(1)
+                    scene_text = detections_to_text(result, frame.shape[1])
+                    print(f"\n탐지 결과:\n{scene_text}", flush=True)
                     question = speech_to_text(config, audio_dir)
                     if not question:
                         print("음성이 인식되지 않았습니다. 다시 v를 눌러 주세요.")
                         continue
                     print(f"질문: {question}", flush=True)
+                    if llm is None:
+                        from llama_cpp import Llama
+                        print("Gemma를 처음 불러옵니다. 잠시 기다려 주세요.", flush=True)
+                        llm = Llama(
+                            model_path=config["gemma_model"],
+                            n_gpu_layers=config["gpu_layers"], n_ctx=1024,
+                            n_batch=16, n_ubatch=16, n_threads=2,
+                            n_threads_batch=2, verbose=False,
+                        )
+                    print("Gemma가 답변을 만드는 중입니다...", flush=True)
                     answer = ask_gemma(llm, scene_text, question)
                     print(f"답변: {answer}", flush=True)
                     text_to_speech(answer, config, audio_dir)
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
                     print(f"질문 처리 실패: {error}", flush=True)
+                finally:
+                    cap = open_camera(cv2, config)
     finally:
         cap.release()
         cv2.destroyAllWindows()
