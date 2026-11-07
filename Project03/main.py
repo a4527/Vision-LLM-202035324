@@ -97,12 +97,21 @@ def main():
     yolo = YOLO(config["yolo_model"])
     llm = Llama(model_path=config["gemma_model"], n_gpu_layers=config["gpu_layers"],
                 n_ctx=2048, n_batch=32, n_ubatch=32, verbose=False)
-    cap = cv2.VideoCapture(config["camera"])
+    # 기존 장비에서 사용한 GStreamer 설정으로 카메라를 연다.
+    pipeline = (
+        f"v4l2src device=/dev/video{config['camera']} ! "
+        "video/x-raw,format=YUY2,width=640,height=480,framerate=30/1 ! "
+        "videoconvert ! video/x-raw,format=BGR ! "
+        "queue leaky=downstream max-size-buffers=1 "
+        "max-size-bytes=0 max-size-time=0 ! "
+        "appsink drop=true max-buffers=1 sync=false"
+    )
+    cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
     print("v: 음성 질문 / q: 종료", flush=True)
 
     try:
         if not cap.isOpened():
-            raise RuntimeError("카메라를 열 수 없습니다. camera 번호를 확인하세요.")
+            raise RuntimeError("카메라를 열 수 없습니다. 장치 번호와 GStreamer 지원을 확인하세요.")
         while True:
             ok, frame = cap.read()
             if not ok:

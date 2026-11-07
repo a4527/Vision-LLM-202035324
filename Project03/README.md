@@ -33,7 +33,9 @@ cd Project03
 python3 -m pip install -r requirements.txt
 ```
 
-위 명령은 Python 패키지 설치용이며 Jetson의 CUDA 빌드 설정까지 구성하지는 않는다. 수업에서 설치한 CUDA 지원 환경과 OpenCV를 사용한다.
+위 명령은 Python 패키지 설치용이며 Jetson의 CUDA 빌드 설정까지 구성하지는 않는다. 수업에서 설치한 CUDA 지원 환경과 GStreamer 지원 OpenCV를 사용한다.
+
+카메라는 기존 `yolotest.py`와 같은 GStreamer pipeline으로 연결한다. `/dev/video0`의 YUY2 영상을 640×480, 30 FPS로 받아 OpenCV가 사용할 BGR 형식으로 바꾼다. 프레임이 밀리지 않도록 오래된 프레임은 버리고 버퍼에는 한 장만 남기도록 설정했다.
 
 `config.json`에서 다음 항목을 확인한다. 상대 경로는 `Project03` 기준이며 절대 경로로 바꿔도 된다. 큰 모델 파일과 Whisper/Piper 실행 도구는 별도로 준비한다.
 
@@ -44,7 +46,7 @@ python3 -m pip install -r requirements.txt
 | `whisper_cli`, `whisper_model` | Whisper 실행 파일과 `ggml-base.bin` 경로 |
 | `piper_python` | Piper 가상환경의 Python 실행 파일 |
 | `piper_model` | 한국어 `.onnx` 모델 경로. 옆에 `.onnx.json`도 필요 |
-| `camera` | USB 카메라 번호, 기본 0 |
+| `camera` | 카메라 장치 번호. 기본 0이면 pipeline에서 `/dev/video0` 사용 |
 | `mic_device`, `speaker_device` | ALSA 장치 이름, 기본 `default` |
 | `record_seconds` | 녹음 시간, 기본 5초 |
 | `confidence` | YOLO 탐지 신뢰도 기준, 기본 0.4 |
@@ -67,7 +69,7 @@ python3 main.py
 4. 터미널에서 인식한 질문과 답변을 확인하고 음성 답변을 듣는다.
 5. 화면이 다시 움직이면 다음 질문을 할 수 있다. 종료는 `q` 또는 `Ctrl+C`다.
 
-카메라가 열리지 않으면 `camera` 번호를 확인한다. 녹음이나 재생 오류가 나면 ALSA 장치 번호를 확인한다. PulseAudio가 장치를 점유한 경우에는 수업에서처럼 `pasuspender -- python3 main.py`로 실행해 본다. 메모리가 부족하면 `gpu_layers` 값을 줄여 일부 연산을 CPU에서 처리할 수 있다.
+카메라가 열리지 않으면 `camera` 번호와 OpenCV의 GStreamer 지원 여부를 확인한다. 녹음이나 재생 오류가 나면 ALSA 장치 번호를 확인한다. PulseAudio가 장치를 점유한 경우에는 수업에서처럼 `pasuspender -- python3 main.py`로 실행해 본다. 메모리가 부족하면 `gpu_layers` 값을 줄여 일부 연산을 CPU에서 처리할 수 있다.
 
 ## 코드 설명
 
