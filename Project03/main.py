@@ -13,6 +13,20 @@ import wave
 PROJECT_DIR = Path(__file__).resolve().parent
 
 
+def memory_summary():
+    # Jetson에서 모델을 올린 전후의 가용 RAM과 전체 SWAP 사용량을 확인한다.
+    try:
+        values = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            key, value = line.split(":", 1)
+            values[key] = int(value.split()[0])
+        available = values["MemAvailable"] // 1024
+        swap_used = (values["SwapTotal"] - values["SwapFree"]) // 1024
+        return f"가용 RAM={available} MiB, 전체 SWAP 사용={swap_used} MiB"
+    except (OSError, KeyError, ValueError):
+        return "메모리 정보를 읽지 못했습니다."
+
+
 def load_config():
     with open(PROJECT_DIR / "config.json", encoding="utf-8") as file:
         config = json.load(file)
@@ -86,6 +100,7 @@ def has_voice(audio_path, threshold):
             raise ValueError("녹음 형식은 16비트 모노여야 합니다.")
         sample_rate = audio.getframerate()
         active_samples = 0
+        max_rms = 0.0
         while True:
             data = audio.readframes(sample_rate // 50)
             if not data:
@@ -95,15 +110,21 @@ def has_voice(audio_path, threshold):
                 samples.byteswap()
             average = sum(samples) / len(samples)
             rms = (sum((value - average) ** 2 for value in samples) / len(samples)) ** 0.5
+            max_rms = max(max_rms, rms)
             if rms >= threshold:
                 active_samples += len(samples)
-        return active_samples >= sample_rate * 0.3
+        active_seconds = active_samples / sample_rate
+        print(f"녹음 확인: 최대 RMS={max_rms:.0f}, 기준={threshold}, "
+              f"기준 이상={active_seconds:.2f}초 (필요: 0.30초)", flush=True)
+        return active_seconds >= 0.3
 
 
 def speech_to_text(config, audio_dir):
     audio_path = audio_dir / "input.wav"
     text_path = audio_dir / "question.txt"
     text_path.unlink(missing_ok=True)
+    print(f"녹음 장치={config['mic_device']}, 무음 기준={config['silence_threshold']}", flush=True)
+    print(f"설정 파일: {PROJECT_DIR / 'config.json'}", flush=True)
     print(f"찾을 물건을 말해 주세요. {config['record_seconds']}초 동안 녹음합니다.", flush=True)
     subprocess.run([
         "arecord", "-q", "-D", config["mic_device"], "-f", "S16_LE",
@@ -128,9 +149,9 @@ def speech_to_text(config, audio_dir):
 def load_gemma(config):
     from llama_cpp import Llama
 
-    print("Gemma를 처음 한 번 불러옵니다...", flush=True)
+    print(f"Gemma를 처음 한 번 불러옵니다 (컨텍스트 {config['context_window']}토큰)...", flush=True)
     return Llama(model_path=config["gemma_model"], n_gpu_layers=config["gpu_layers"],
-                 n_ctx=1024, n_batch=16, n_ubatch=16, n_threads=2,
+                 n_ctx=config["context_window"], n_batch=16, n_ubatch=16, n_threads=2,
                  n_threads_batch=2, verbose=False)
 
 
@@ -138,19 +159,23 @@ def choose_target(llm, request, class_names):
     response = llm.create_chat_completion(
         messages=[
             {"role": "system", "content": (
-                "물건 찾기 요청을 JSON 하나로 바꿔라. "
-                f"object는 다음 YOLO 클래스 중 하나: {', '.join(class_names)}. "
-                f"color는 다음 중 하나: {', '.join(COLOR_NAMES)}. "
-                "색을 말하지 않으면 any다. name은 물건 종류의 짧은 한국어 이름이다. "
-                '예: 빨간 컵이 보이면 알려줘 -> {"object":"cup","color":"red","name":"컵"}. '
-                "대상이 여러 개, 미지원 물건/색상, 색 외 추가 조건은 object를 unknown으로 해라. "
-                "임의의 비슷한 물건이나 색으로 바꾸지 마라."
+                "Parse a Korean object-finding request as JSON. "
+                f"object must be one of: {','.join(class_names)}. "
+                f"color must be one of: {','.join(COLOR_NAMES)}; no color means any. "
+                "name is the short Korean object noun. "
+                'Example: 초록사과 -> {"object":"apple","color":"green","name":"사과"}. '
+                "For unsupported objects/colors, multiple targets or extra conditions, "
+                'return {"object":"unknown","color":"any","name":""}. Do not substitute.'
             )},
             {"role": "user", "content": request},
         ],
         response_format={"type": "json_object"},
         max_tokens=96, temperature=0.0,
     )
+    # 실제 입력량에는 사용자 말 외에 지시문, 클래스 목록, 채팅 형식도 포함된다.
+    prompt_tokens = response.get("usage", {}).get("prompt_tokens")
+    if prompt_tokens is not None:
+        print(f"Gemma 전체 입력: {prompt_tokens}토큰", flush=True)
     target = json.loads(response["choices"][0]["message"]["content"] or "{}")
     if not isinstance(target, dict):
         raise ValueError("요청을 해석하지 못했습니다. 물건 하나를 다시 말해 주세요.")
@@ -211,8 +236,10 @@ def main():
     audio_dir = PROJECT_DIR / "runtime"
     audio_dir.mkdir(exist_ok=True)
     print("YOLO를 불러오는 중입니다...", flush=True)
+    print(f"모델 로딩 전: {memory_summary()}", flush=True)
     yolo = YOLO(config["yolo_model"])
     llm = load_gemma(config)
+    print(f"모델 로딩 후: {memory_summary()}", flush=True)
     target = None
     found_count = 0
     last_check = 0
@@ -255,7 +282,11 @@ def main():
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
                     print(f"음성 처리 실패: {error}", flush=True)
 
+            read_started = time.perf_counter()
             ok, frame = cap.read()
+            read_elapsed = time.perf_counter() - read_started
+            if read_elapsed >= 1.0:
+                print(f"카메라 수신 지연: {read_elapsed:.1f}초 / {memory_summary()}", flush=True)
             if not ok:
                 failures += 1
                 found_count = 0
@@ -296,8 +327,12 @@ def main():
                 status = f"{target['color']} {target['object']}" if target else "v: new request"
             cv2.putText(output, status, (8, 20), cv2.FONT_HERSHEY_SIMPLEX,
                         0.45, (0, 255, 0), 1)
+            display_started = time.perf_counter()
             cv2.imshow("Find it - v: request, c: cancel, q: quit", output)
             key = cv2.waitKey(1) & 0xFF
+            display_elapsed = time.perf_counter() - display_started
+            if display_elapsed >= 1.0:
+                print(f"화면 갱신 지연: {display_elapsed:.1f}초 / {memory_summary()}", flush=True)
             if key == ord("q"):
                 break
             if key == ord("h"):

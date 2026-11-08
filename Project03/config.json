@@ -10,8 +10,9 @@
   "mic_device": "default",
   "speaker_device": "default",
   "record_seconds": 5,
-  "silence_threshold": 500,
+  "silence_threshold": 200,
   "gpu_layers": 0,
+  "context_window": 2048,
   "check_interval": 1.0,
   "confirm_count": 3,
   "color_min_ratio": 0.35
