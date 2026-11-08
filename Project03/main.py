@@ -2,6 +2,7 @@
 
 import json
 from array import array
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import subprocess
 import sys
@@ -124,43 +125,52 @@ def speech_to_text(config, audio_dir):
     return question
 
 
-def choose_target(request, config, class_names):
+def load_gemma(config):
     from llama_cpp import Llama
 
-    print("Gemma가 찾을 물건을 정하는 중입니다...", flush=True)
-    llm = Llama(model_path=config["gemma_model"], n_gpu_layers=config["gpu_layers"],
-                n_ctx=1024, n_batch=16, n_ubatch=16, n_threads=2,
-                n_threads_batch=2, verbose=False)
-    try:
-        response = llm.create_chat_completion(
-            messages=[
-                {"role": "system", "content": (
-                    "물건 찾기 요청을 JSON 하나로 바꿔라. "
-                    f"object는 다음 YOLO 클래스 중 하나: {', '.join(class_names)}. "
-                    f"color는 다음 중 하나: {', '.join(COLOR_NAMES)}. "
-                    "색을 말하지 않으면 any다. name은 물건 종류의 짧은 한국어 이름이다. "
-                    '예: 빨간 컵이 보이면 알려줘 -> {"object":"cup","color":"red","name":"컵"}. '
-                    "대상이 여러 개, 미지원 물건/색상, 색 외 추가 조건은 object를 unknown으로 해라. "
-                    "임의의 비슷한 물건이나 색으로 바꾸지 마라."
-                )},
-                {"role": "user", "content": request},
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=96, temperature=0.0,
-        )
-        target = json.loads(response["choices"][0]["message"]["content"] or "{}")
-        if not isinstance(target, dict):
-            raise ValueError("요청을 해석하지 못했습니다. 물건 하나를 다시 말해 주세요.")
-        name = target.get("name")
-        if (not isinstance(target.get("object"), str) or target["object"] not in class_names
-                or not isinstance(target.get("color"), str) or target["color"] not in COLOR_NAMES
-                or not isinstance(name, str) or not name.strip() or len(name) > 30):
-            raise ValueError("지원하는 물건과 색상 하나로 다시 말해 주세요.")
-        target["label"] = f"{COLOR_NAMES[target['color']]} {name.strip()}".strip()
-        return target
-    finally:
-        # 관찰할 때는 Gemma가 필요 없으므로 모델 메모리를 해제한다.
-        llm.close()
+    print("Gemma를 처음 한 번 불러옵니다...", flush=True)
+    return Llama(model_path=config["gemma_model"], n_gpu_layers=config["gpu_layers"],
+                 n_ctx=1024, n_batch=16, n_ubatch=16, n_threads=2,
+                 n_threads_batch=2, verbose=False)
+
+
+def choose_target(llm, request, class_names):
+    response = llm.create_chat_completion(
+        messages=[
+            {"role": "system", "content": (
+                "물건 찾기 요청을 JSON 하나로 바꿔라. "
+                f"object는 다음 YOLO 클래스 중 하나: {', '.join(class_names)}. "
+                f"color는 다음 중 하나: {', '.join(COLOR_NAMES)}. "
+                "색을 말하지 않으면 any다. name은 물건 종류의 짧은 한국어 이름이다. "
+                '예: 빨간 컵이 보이면 알려줘 -> {"object":"cup","color":"red","name":"컵"}. '
+                "대상이 여러 개, 미지원 물건/색상, 색 외 추가 조건은 object를 unknown으로 해라. "
+                "임의의 비슷한 물건이나 색으로 바꾸지 마라."
+            )},
+            {"role": "user", "content": request},
+        ],
+        response_format={"type": "json_object"},
+        max_tokens=96, temperature=0.0,
+    )
+    target = json.loads(response["choices"][0]["message"]["content"] or "{}")
+    if not isinstance(target, dict):
+        raise ValueError("요청을 해석하지 못했습니다. 물건 하나를 다시 말해 주세요.")
+    name = target.get("name")
+    if (not isinstance(target.get("object"), str) or target["object"] not in class_names
+            or not isinstance(target.get("color"), str) or target["color"] not in COLOR_NAMES
+            or not isinstance(name, str) or not name.strip() or len(name) > 30):
+        raise ValueError("지원하는 물건과 색상 하나로 다시 말해 주세요.")
+    target["label"] = f"{COLOR_NAMES[target['color']]} {name.strip()}".strip()
+    return target
+
+
+def register_request(llm, config, class_names, audio_dir):
+    request = speech_to_text(config, audio_dir)
+    if not request:
+        print("요청이 없어 기존 상태를 유지합니다.", flush=True)
+        return None
+    print(f"요청: {request}", flush=True)
+    print("Gemma가 찾을 조건을 해석하는 중입니다...", flush=True)
+    return choose_target(llm, request, class_names)
 
 
 def text_to_speech(text, config, audio_dir):
@@ -202,19 +212,49 @@ def main():
     audio_dir.mkdir(exist_ok=True)
     print("YOLO를 불러오는 중입니다...", flush=True)
     yolo = YOLO(config["yolo_model"])
+    llm = load_gemma(config)
     target = None
     found_count = 0
     last_check = 0
     class_ids = {name: number for number, name in yolo.names.items()}
     print(f"이 YOLO 모델이 지원하는 물건 종류: {len(class_ids)}개", flush=True)
-    cap = open_camera(cv2, config)
+    support_text = "지원 물체\n" + "\n".join(
+        f"{number}: {name}" for name, number in class_ids.items()
+    ) + "\n\n지원 색상: " + ", ".join(name for name in COLOR_NAMES.values() if name)
+    support_path = audio_dir / "supported_objects.txt"
+    support_path.write_text(support_text + "\n", encoding="utf-8")
+    print(f"지원 목록: {support_path} (h 키로 터미널에 출력)", flush=True)
+    # 오래 걸리는 음성 처리만 작업 스레드 하나에서 실행한다.
+    worker = ThreadPoolExecutor(max_workers=1)
+    pending = None
+    pending_kind = None
+    ignore_request = False
+    cap = None
     failures = 0
-    print("v: 찾을 물건 등록 / c: 찾기 취소 / q: 종료", flush=True)
+    print("준비 완료. v: 음성 등록 / c: 취소 / h: 지원 목록 / q: 종료", flush=True)
 
     try:
+        cap = open_camera(cv2, config)
         if not cap.isOpened():
             raise RuntimeError("카메라를 열 수 없습니다. 장치 번호와 GStreamer 지원을 확인하세요.")
         while True:
+            if pending is not None and pending.done():
+                finished = pending
+                kind = pending_kind
+                pending = None
+                try:
+                    new_target = finished.result()
+                    if kind == "request" and not ignore_request and new_target:
+                        target = new_target
+                        found_count = 0
+                        last_check = 0
+                        message = f"{target['label']}이 보이면 알려드릴게요."
+                        print(message, flush=True)
+                        pending = worker.submit(text_to_speech, message, config, audio_dir)
+                        pending_kind = "speech"
+                except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                    print(f"음성 처리 실패: {error}", flush=True)
+
             ok, frame = cap.read()
             if not ok:
                 failures += 1
@@ -232,7 +272,7 @@ def main():
             failures = 0
 
             output = frame
-            if target and time.monotonic() - last_check >= config["check_interval"]:
+            if target and pending is None and time.monotonic() - last_check >= config["check_interval"]:
                 result = yolo.predict(
                     frame, conf=config["confidence"], imgsz=320,
                     classes=[class_ids[target["object"]]], max_det=5, verbose=False,
@@ -247,50 +287,40 @@ def main():
                     # 한 번 알린 뒤에는 찾기를 끝내 같은 물건을 계속 읽지 않는다.
                     target = None
                     found_count = 0
-                    cap.release()
-                    try:
-                        text_to_speech(message, config, audio_dir)
-                    except (OSError, subprocess.SubprocessError) as error:
-                        print(f"음성 재생 실패: {error}", flush=True)
-                    finally:
-                        cap = open_camera(cv2, config)
+                    pending = worker.submit(text_to_speech, message, config, audio_dir)
+                    pending_kind = "speech"
 
-            status = f"{target['color']} {target['object']}" if target else "v: new request"
+            if pending is not None:
+                status = "Listening / processing..." if pending_kind == "request" else "Speaking..."
+            else:
+                status = f"{target['color']} {target['object']}" if target else "v: new request"
             cv2.putText(output, status, (8, 20), cv2.FONT_HERSHEY_SIMPLEX,
                         0.45, (0, 255, 0), 1)
             cv2.imshow("Find it - v: request, c: cancel, q: quit", output)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
+            if key == ord("h"):
+                print(support_text, flush=True)
             if key == ord("c"):
+                ignore_request = True
                 target = None
                 found_count = 0
                 print("찾기를 취소했습니다.", flush=True)
-            if key == ord("v"):
-                cap.release()
-                try:
-                    request = speech_to_text(config, audio_dir)
-                    if not request:
-                        print("요청이 없어 기존 상태로 돌아갑니다.", flush=True)
-                        continue
-                    print(f"요청: {request}", flush=True)
-                    new_target = choose_target(request, config, list(class_ids))
-                    target = new_target
-                    found_count = 0
-                    last_check = 0
-                    print(f"{target['label']}을 찾습니다. 발견하면 한 번 알려드립니다.", flush=True)
-                    text_to_speech(f"{target['label']}이 보이면 알려드릴게요.", config, audio_dir)
-                except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-                    print(f"요청 처리 실패: {error}", flush=True)
-                finally:
-                    cap = open_camera(cv2, config)
-                    # 처리 중 쌓인 키 입력이 다음 요청을 다시 시작하지 않게 비운다.
-                    for _ in range(100):
-                        if cv2.waitKey(1) == -1:
-                            break
+            if key == ord("v") and pending is None:
+                ignore_request = False
+                found_count = 0
+                pending_kind = "request"
+                pending = worker.submit(register_request, llm, config, list(class_ids), audio_dir)
     finally:
-        cap.release()
+        if cap is not None:
+            cap.release()
         cv2.destroyAllWindows()
+        # 진행 중인 추론이 끝난 뒤 모델을 닫아 메모리 접근 충돌을 막는다.
+        if pending is not None and not pending.done():
+            print("진행 중인 음성 처리를 마친 뒤 종료합니다.", flush=True)
+        worker.shutdown(wait=True)
+        llm.close()
 
 
 if __name__ == "__main__":
