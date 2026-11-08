@@ -1,6 +1,7 @@
 """찾아줘: 음성으로 물건을 등록하면 화면에 나타났을 때 한 번 알려 준다."""
 
 import json
+import os
 from array import array
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -11,6 +12,8 @@ import wave
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
+# 지원하는 OpenCV 빌드에서 V4L2의 프레임 대기를 짧게 제한한다.
+os.environ.setdefault("OPENCV_VIDEOIO_V4L_SELECT_TIMEOUT", "3")
 
 
 def memory_summary():
@@ -156,11 +159,13 @@ def load_gemma(config):
 
 
 def choose_target(llm, request, class_names):
+    print("Gemma 요청: 전체 클래스 목록은 전송하지 않습니다.", flush=True)
     response = llm.create_chat_completion(
         messages=[
             {"role": "system", "content": (
                 "Parse a Korean object-finding request as JSON. "
-                f"object must be one of: {','.join(class_names)}. "
+                "object is a standard English object-detection class name, "
+                "e.g. apple, cup, cell phone, couch, tv. "
                 f"color must be one of: {','.join(COLOR_NAMES)}; no color means any. "
                 "name is the short Korean object noun. "
                 'Example: 초록사과 -> {"object":"apple","color":"green","name":"사과"}. '
@@ -172,7 +177,7 @@ def choose_target(llm, request, class_names):
         response_format={"type": "json_object"},
         max_tokens=96, temperature=0.0,
     )
-    # 실제 입력량에는 사용자 말 외에 지시문, 클래스 목록, 채팅 형식도 포함된다.
+    # 클래스 목록은 보내지 않고, 해석 결과를 아래 코드에서 실제 목록과 비교한다.
     prompt_tokens = response.get("usage", {}).get("prompt_tokens")
     if prompt_tokens is not None:
         print(f"Gemma 전체 입력: {prompt_tokens}토큰", flush=True)
@@ -180,8 +185,9 @@ def choose_target(llm, request, class_names):
     if not isinstance(target, dict):
         raise ValueError("요청을 해석하지 못했습니다. 물건 하나를 다시 말해 주세요.")
     name = target.get("name")
-    if (not isinstance(target.get("object"), str) or target["object"] not in class_names
-            or not isinstance(target.get("color"), str) or target["color"] not in COLOR_NAMES
+    if not isinstance(target.get("object"), str) or target["object"] not in class_names:
+        raise ValueError("해석한 물건이 YOLO 지원 목록에 없습니다. h로 클래스 이름을 확인하세요.")
+    if (not isinstance(target.get("color"), str) or target["color"] not in COLOR_NAMES
             or not isinstance(name, str) or not name.strip() or len(name) > 30):
         raise ValueError("지원하는 물건과 색상 하나로 다시 말해 주세요.")
     target["label"] = f"{COLOR_NAMES[target['color']]} {name.strip()}".strip()
@@ -210,18 +216,37 @@ def text_to_speech(text, config, audio_dir):
 
 
 def open_camera(cv2, config):
-    # 장비 입력은 기존 형식을 유지하고, 처리할 영상만 작게 줄인다.
-    pipeline = (
-        f"v4l2src device=/dev/video{config['camera']} ! "
-        "video/x-raw,format=YUY2,width=640,height=480,framerate=30/1 ! "
-        "queue leaky=downstream max-size-buffers=1 "
-        "max-size-bytes=0 max-size-time=0 ! "
-        "videorate drop-only=true ! video/x-raw,framerate=10/1 ! "
-        "videoscale ! video/x-raw,width=320,height=240 ! "
-        "videoconvert ! video/x-raw,format=BGR ! "
-        "appsink drop=true max-buffers=1 sync=false"
-    )
-    return cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+    backend = config.get("camera_backend", "gstreamer")
+    print(f"카메라 연결 방식: {backend}", flush=True)
+    if backend == "v4l2":
+        # USB 카메라를 직접 열어 GStreamer appsink 경로를 우회한다.
+        cap = cv2.VideoCapture(config["camera"], cv2.CAP_V4L2)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, 30)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    elif backend == "gstreamer":
+        # 시연 카메라가 바뀌면 config.json의 문자열만 교체한다.
+        pipeline = config.get("camera_pipeline") or (
+            f"v4l2src device=/dev/video{config['camera']} ! "
+            "video/x-raw,format=YUY2,width=640,height=480,framerate=30/1 ! "
+            "videoconvert ! video/x-raw,format=BGR ! "
+            "queue leaky=downstream max-size-buffers=1 "
+            "max-size-bytes=0 max-size-time=0 ! "
+            "appsink drop=true max-buffers=1 sync=false"
+        )
+        print(f"카메라 pipeline: {pipeline}", flush=True)
+        if not all(hasattr(cv2, key) for key in ("CAP_PROP_OPEN_TIMEOUT_MSEC", "CAP_PROP_READ_TIMEOUT_MSEC")):
+            raise RuntimeError("이 OpenCV는 GStreamer 제한 시간을 지원하지 않습니다. v4l2를 사용하세요.")
+        cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER, [
+            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000,
+            cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000,
+        ])
+    else:
+        raise ValueError("camera_backend는 v4l2 또는 gstreamer로 설정하세요.")
+    return cap
 
 
 def main():
@@ -238,12 +263,15 @@ def main():
     print("YOLO를 불러오는 중입니다...", flush=True)
     print(f"모델 로딩 전: {memory_summary()}", flush=True)
     yolo = YOLO(config["yolo_model"])
+    class_ids = {name: number for number, name in yolo.names.items()}
+    print(f"YOLO 클래스: {len(class_ids)}개 / 예시: {', '.join(list(class_ids)[:8])}", flush=True)
+    if not class_ids or all(name.startswith("class") and name[5:].isdigit() for name in class_ids):
+        raise ValueError("YOLO 클래스 이름을 읽지 못했습니다. config.json의 실제 .pt 파일 경로를 확인하세요.")
     llm = load_gemma(config)
     print(f"모델 로딩 후: {memory_summary()}", flush=True)
     target = None
     found_count = 0
     last_check = 0
-    class_ids = {name: number for number, name in yolo.names.items()}
     print(f"이 YOLO 모델이 지원하는 물건 종류: {len(class_ids)}개", flush=True)
     support_text = "지원 물체\n" + "\n".join(
         f"{number}: {name}" for name, number in class_ids.items()
@@ -263,7 +291,7 @@ def main():
     try:
         cap = open_camera(cv2, config)
         if not cap.isOpened():
-            raise RuntimeError("카메라를 열 수 없습니다. 장치 번호와 GStreamer 지원을 확인하세요.")
+            raise RuntimeError("카메라를 열 수 없습니다. 장치 번호, 점유 상태, camera_backend를 확인하세요.")
         while True:
             if pending is not None and pending.done():
                 finished = pending
@@ -287,7 +315,7 @@ def main():
             read_elapsed = time.perf_counter() - read_started
             if read_elapsed >= 1.0:
                 print(f"카메라 수신 지연: {read_elapsed:.1f}초 / {memory_summary()}", flush=True)
-            if not ok:
+            if not ok or frame is None or frame.size == 0:
                 failures += 1
                 found_count = 0
                 print(f"카메라 읽기 실패 ({failures}/3)", flush=True)
@@ -301,6 +329,8 @@ def main():
                 cap = open_camera(cv2, config)
                 continue
             failures = 0
+            if frame.shape[:2] != (240, 320):
+                frame = cv2.resize(frame, (320, 240), interpolation=cv2.INTER_AREA)
 
             output = frame
             if target and pending is None and time.monotonic() - last_check >= config["check_interval"]:
@@ -329,7 +359,7 @@ def main():
                         0.45, (0, 255, 0), 1)
             display_started = time.perf_counter()
             cv2.imshow("Find it - v: request, c: cancel, q: quit", output)
-            key = cv2.waitKey(1) & 0xFF
+            key = cv2.waitKey(100) & 0xFF
             display_elapsed = time.perf_counter() - display_started
             if display_elapsed >= 1.0:
                 print(f"화면 갱신 지연: {display_elapsed:.1f}초 / {memory_summary()}", flush=True)
